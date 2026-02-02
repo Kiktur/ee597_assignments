@@ -16,7 +16,7 @@ pt_db = 0
 kref_db = -20
 d0 = 1
 
-d = np.arange(1, 7001)  # 1 to 7000 meters
+d = np.arange(1, 10001)  # 1 to 10000 meters
 
 eta_vals = [2, 4]
 N0 = -80

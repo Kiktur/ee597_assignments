@@ -25,6 +25,7 @@ kref_db = -20
 d0 = 1
 N0 = -80
 
+
 # 1 to 7000 meters
 d = np.arange(1, 7001)
 
@@ -41,7 +42,13 @@ plt.semilogy(d, BER_no_fading, 'k', linewidth=2, label='No fading')
 
 BER_avg = np.zeros((len(sigma_vals), len(d)))
 
+
+# TODO: Could switch to integrating in linear scale instead?
+# 20 dB variance seems to converge to less than 0.5, but it might be ok?
+
 for k, sigma in enumerate(sigma_vals):
+
+
     for i in range(len(d)):
         gamma_bar_dB = ebno_db[i]
 
@@ -58,12 +65,11 @@ for k, sigma in enumerate(sigma_vals):
     plt.plot(d, BER_avg[k, :], linewidth=2, label=rf'$\sigma = {sigma}$ dB')
 
 
-# TODO: Maybe make the plot look nicer and increase distance range
 plt.xlabel('Distance (m)')
 plt.ylabel('Bit Error Rate (BER)')
-plt.title('Average BER vs Distance with Log-Normal Fading')
+plt.title('Expected BER vs Distance with Log-Normal Fading')
 plt.ylim([1e-5, 1])
-plt.yscale('linear')
+plt.yscale('log')
 plt.grid(True)
-plt.legend(loc='upper right')
+plt.legend(loc='lower right')
 plt.show()

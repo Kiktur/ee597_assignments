@@ -34,14 +34,16 @@ ebno_lin = 10 ** (ebno_db / 10)
 
 W = 20 * (10 ** 6)
 
+
 # Shannon capacity
 C = W * np.log2(1 + ebno_lin)
 
 
+
 plt.figure()
-plt.plot(d, C, linewidth=2)
+plt.plot(d, C / 1e6, linewidth=2)
 plt.grid(True)
 plt.xlabel('Distance (m)')
-plt.ylabel('Data Rate (bits/sec)')
+plt.ylabel('Data Rate (Mbps)')
 plt.title('Maximum Data Rate vs Distance')
 plt.show()
