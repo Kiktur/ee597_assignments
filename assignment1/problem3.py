@@ -47,3 +47,21 @@ plt.xlabel('Distance (m)')
 plt.ylabel('Data Rate (Mbps)')
 plt.title('Maximum Data Rate vs Distance')
 plt.show()
+
+# High-SNR approximation
+log2_10 = np.log2(10)
+A = (W * log2_10 / 10) * (pt_db + kref_db - N0)
+B = W * eta * log2_10
+
+C_approx = A - B * np.log10(d)
+C_approx = np.maximum(C_approx, 0)
+
+plt.figure()
+plt.plot(d, C / 1e6, linewidth=2, label='Shannon Capacity')
+plt.plot(d, C_approx / 1e6, '--', linewidth=2, label=f'Approximation: C ≈ {A/1e6:.1f} - {B/1e6:.1f}·log₁₀(d) Mbps')
+plt.grid(True)
+plt.xlabel('Distance (m)')
+plt.ylabel('Data Rate (Mbps)')
+plt.title('Maximum Data Rate vs Distance')
+plt.legend()
+plt.show()
