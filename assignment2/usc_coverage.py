@@ -20,6 +20,7 @@ Performance Notes:
 - Install Numba for faster performance: pip install numba
 """
 
+
 import math
 import numpy as np
 from PIL import Image
