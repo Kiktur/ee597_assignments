@@ -390,6 +390,27 @@ class CoverageCalculator:
         )
         return result['coverage_percent']
 
+    def calculate_coverage_with_uncovered(
+        self,
+        bs_locations: List[Tuple[float, float]],
+        tx_power: float = TX_POWER_DBM,
+        noise: float = NOISE_DBM,
+        snr_threshold: float = SNR_THRESHOLD_DB,
+        shadow_std: float = SHADOW_STD_DB,
+        freq_hz: float = FREQ_HZ,
+        seed: int = SEED
+    ) -> Tuple[float, np.ndarray]:
+        """Calculate coverage percentage and uncovered outdoor pixel mask.
+
+        Returns:
+            (coverage_percent, uncovered_mask) where uncovered_mask is a flat
+            np.uint8 array of shape (small_total,) with 1 = uncovered outdoor pixel.
+        """
+        result = self.calculate_coverage_detailed(
+            bs_locations, tx_power, noise, snr_threshold, shadow_std, freq_hz, seed
+        )
+        return result['coverage_percent'], result['uncovered_mask']
+
     def calculate_coverage_detailed(
         self,
         bs_locations: List[Tuple[float, float]],
@@ -544,6 +565,7 @@ class CoverageCalculator:
         alpha = 0.35
         one_minus_alpha = 0.65
         total_covered = 0
+        uncovered_mask = np.zeros(self.small_total, dtype=np.uint8)
 
         col_r = np.array([alpha * c[0] for c in colors_float], dtype=np.float32)
         col_g = np.array([alpha * c[1] for c in colors_float], dtype=np.float32)
@@ -570,6 +592,8 @@ class CoverageCalculator:
                 image_data[sy, sx, 0] = int(r * 255 + 0.5)
                 image_data[sy, sx, 1] = int(g * 255 + 0.5)
                 image_data[sy, sx, 2] = int(b * 255 + 0.5)
+            else:
+                uncovered_mask[i] = 1
 
         coverage_percent = (100.0 * total_covered / self.small_outdoor_count) if self.small_outdoor_count > 0 else 0.0
 
@@ -579,7 +603,8 @@ class CoverageCalculator:
             'image_data': image_data,
             'render_width': self.small_w,
             'render_height': self.small_h,
-            'bs_colors': bs_colors
+            'bs_colors': bs_colors,
+            'uncovered_mask': uncovered_mask
         }
 
     def _ensure_ray_table(self):
@@ -755,42 +780,78 @@ def _pick_diverse_location(
     calc: 'CoverageCalculator',
     existing_locations: List[Tuple[float, float]],
     rng: 'SeededRNG',
-    num_candidates: int = 50
+    num_candidates: int = 50,
+    coverage_percent: float = 0.0,
+    uncovered_mask: Optional[np.ndarray] = None
 ) -> Tuple[float, float]:
-    """Pick a new BS location that maximizes minimum distance to existing BSs.
+    """Pick a new BS location using spatial diversity, with gap-filling at high coverage.
 
-    Samples num_candidates random outdoor locations and returns the one
-    with the greatest minimum distance to any existing BS, encouraging
-    spatial spread and reducing coverage overlap. Uses a large candidate
-    pool to favor open areas far from existing coverage.
+    Below 85% coverage: maximizes minimum distance to existing BSs (spread out).
+    At 85%+ coverage (with uncovered_mask): scores candidates by the density of
+    uncovered outdoor pixels in their vicinity, placing new BSs where they can
+    cover the most remaining gaps.
 
     Args:
         calc: CoverageCalculator instance.
         existing_locations: Current list of (x_meters, y_meters) BS positions.
         rng: SeededRNG instance for reproducibility.
         num_candidates: Number of random candidates to evaluate (default: 50).
+        coverage_percent: Current coverage percentage, used to switch modes.
+        uncovered_mask: Flat uint8 array (small_total,) with 1 = uncovered outdoor pixel.
+                        Required for gap-filling mode at 85%+.
 
     Returns:
-        (x_meters, y_meters) tuple for the most spatially diverse candidate.
+        (x_meters, y_meters) tuple for the selected candidate.
     """
     if not existing_locations:
         return calc.get_random_outdoor_location(rng)
 
+    gap_fill_mode = coverage_percent >= 85.0 and uncovered_mask is not None
+    # Search radius in small-grid pixels (~50m at 1/8 scale)
+    search_r = 25
+
     best_loc = None
-    best_min_dist = -1.0
+    best_score = -1.0
 
     for _ in range(num_candidates):
         x, y = calc.get_random_outdoor_location(rng)
 
-        # Compute minimum distance to any existing BS
-        min_dist = float('inf')
-        for ex, ey in existing_locations:
-            d = (x - ex) ** 2 + (y - ey) ** 2
-            if d < min_dist:
-                min_dist = d
+        if gap_fill_mode:
+            # Convert candidate to small-grid coordinates
+            sx = int(x / MAP_WIDTH_M * calc.small_w)
+            sy = int(y / MAP_HEIGHT_M * calc.small_h)
+            sx = max(0, min(calc.small_w - 1, sx))
+            sy = max(0, min(calc.small_h - 1, sy))
 
-        if min_dist > best_min_dist:
-            best_min_dist = min_dist
+            # Count uncovered pixels within search radius
+            uncovered_count = 0
+            r_sq = search_r * search_r
+            y_lo = max(0, sy - search_r)
+            y_hi = min(calc.small_h - 1, sy + search_r)
+            x_lo = max(0, sx - search_r)
+            x_hi = min(calc.small_w - 1, sx + search_r)
+            for py in range(y_lo, y_hi + 1):
+                dy = py - sy
+                dy_sq = dy * dy
+                row_off = py * calc.small_w
+                for px in range(x_lo, x_hi + 1):
+                    dx = px - sx
+                    if dx * dx + dy_sq <= r_sq:
+                        if uncovered_mask[row_off + px] == 1:
+                            uncovered_count += 1
+
+            score = float(uncovered_count)
+        else:
+            # Spread mode: maximize minimum distance to existing BSs
+            min_dist = float('inf')
+            for ex, ey in existing_locations:
+                d = (x - ex) ** 2 + (y - ey) ** 2
+                if d < min_dist:
+                    min_dist = d
+            score = min_dist
+
+        if score > best_score:
+            best_score = score
             best_loc = (x, y)
 
     return best_loc
@@ -800,14 +861,17 @@ def sa_neighbor(
     calc: 'CoverageCalculator',
     current_locations: List[Tuple[float, float]],
     rng: 'SeededRNG',
-    move_radius: float = 50.0
+    move_radius: float = 50.0,
+    coverage_percent: float = 0.0,
+    uncovered_mask: Optional[np.ndarray] = None
 ) -> List[Tuple[float, float]]:
     """Generate a neighbor solution by perturbing the current BS placement.
 
     Three move types are chosen at random:
       - Move (50%): Shift a random BS to a nearby outdoor location.
-      - Add  (35%): Insert a new BS in an open area far from existing BSs
-                     (uses spatial diversity with 50 candidates).
+                     At 85%+ coverage, move radius shrinks for fine-tuning.
+      - Add  (35%): Insert a new BS. At 85%+ with uncovered mask, targets
+                     areas with the most uncovered pixels.
       - Remove (15%): Remove a random BS (only if more than 1 remain).
 
     All generated locations are guaranteed to be outdoor via calc.is_outdoor().
@@ -817,12 +881,18 @@ def sa_neighbor(
         current_locations: Current list of (x_meters, y_meters) BS positions.
         rng: SeededRNG instance for reproducibility.
         move_radius: Maximum displacement in meters for the move operation.
+        coverage_percent: Current coverage percentage, affects fine-tuning behavior.
+        uncovered_mask: Flat uint8 array (small_total,) with 1 = uncovered outdoor pixel.
 
     Returns:
         New list of (x_meters, y_meters) BS positions.
     """
     neighbor = list(current_locations)
     n = len(neighbor)
+    fine_tune = coverage_percent >= 85.0
+
+    # In fine-tune mode, use a tighter move radius
+    effective_move_radius = move_radius * 0.5 if fine_tune else move_radius
 
     r = rng.uniform()
 
@@ -831,8 +901,8 @@ def sa_neighbor(
         idx = int(rng.uniform() * n) % n
         x_old, y_old = neighbor[idx]
         for _ in range(50):  # retry until outdoor location found
-            dx = rng.normal(0.0, move_radius)
-            dy = rng.normal(0.0, move_radius)
+            dx = rng.normal(0.0, effective_move_radius)
+            dy = rng.normal(0.0, effective_move_radius)
             x_new = max(0.0, min(MAP_WIDTH_M, x_old + dx))
             y_new = max(0.0, min(MAP_HEIGHT_M, y_old + dy))
             if calc.is_outdoor(x_new, y_new):
@@ -840,8 +910,12 @@ def sa_neighbor(
                 break
 
     elif r < 0.85:
-        # Add: insert a new BS in open area (spatial diversity with 50 candidates)
-        x_new, y_new = _pick_diverse_location(calc, neighbor, rng, num_candidates=50)
+        # Add: insert a new BS (gap-filling at 85%+ via uncovered mask)
+        x_new, y_new = _pick_diverse_location(
+            calc, neighbor, rng, num_candidates=50,
+            coverage_percent=coverage_percent,
+            uncovered_mask=uncovered_mask
+        )
         neighbor.append((x_new, y_new))
 
     elif n > 1:
@@ -853,8 +927,8 @@ def sa_neighbor(
         # Only 1 BS and remove was selected — move it instead
         x_old, y_old = neighbor[0]
         for _ in range(50):
-            dx = rng.normal(0.0, move_radius)
-            dy = rng.normal(0.0, move_radius)
+            dx = rng.normal(0.0, effective_move_radius)
+            dy = rng.normal(0.0, effective_move_radius)
             x_new = max(0.0, min(MAP_WIDTH_M, x_old + dx))
             y_new = max(0.0, min(MAP_HEIGHT_M, y_old + dy))
             if calc.is_outdoor(x_new, y_new):
@@ -866,7 +940,7 @@ def sa_neighbor(
 
 def simulated_annealing(
     calc: 'CoverageCalculator',
-    target_coverage: float = 90.0,
+    target_coverage: float = 95.0,
     # --- SA parameters (aggressive defaults for speed) ---
     T_init: float = 50.0,
     T_min: float = 2.0,
@@ -927,13 +1001,14 @@ def simulated_annealing(
         loc = _pick_diverse_location(calc, current_locations, rng, num_candidates=100)
         current_locations.append(loc)
 
-    current_coverage = calc.calculate_coverage(current_locations)
+    current_coverage, current_uncovered = calc.calculate_coverage_with_uncovered(current_locations)
     current_cost = sa_cost_function(len(current_locations), current_coverage,
                                     target_coverage, w_bs, w_coverage)
 
     best_locations = list(current_locations)
     best_cost = current_cost
     best_coverage = current_coverage
+    best_uncovered = current_uncovered
 
     history = []
     T = T_init
@@ -950,7 +1025,7 @@ def simulated_annealing(
         print(f"  Numba: {'enabled' if NUMBA_AVAILABLE else 'disabled (install for 10x speedup)'}")
         print(f"  Initial BSs: {initial_num_bs}, Seed: {seed}")
         print(f"  Mode: Continue until target coverage is reached")
-        print(f"  Optimization: Spatial diversity (50 candidates)")
+        print(f"  Optimization: Spatial diversity (50 candidates, gap-fill at 85%+)")
         print(f"{'='*60}")
         print(f"{'Temp':>10s} {'Cost':>10s} {'Coverage':>10s} {'#BS':>5s}")
         print(f"{'-'*10} {'-'*10} {'-'*10} {'-'*5}")
@@ -958,10 +1033,12 @@ def simulated_annealing(
     # Continue until target coverage is reached or safety limit is hit
     while best_coverage < target_coverage and total_iters < max_total_iters:
         for _ in range(max_iter_per_temp):
-            # Generate neighbor using spatial diversity
-            neighbor_locations = sa_neighbor(calc, current_locations, rng, move_radius)
+            # Generate neighbor (gap-fills using uncovered mask at 85%+)
+            neighbor_locations = sa_neighbor(calc, current_locations, rng, move_radius,
+                                             coverage_percent=best_coverage,
+                                             uncovered_mask=best_uncovered)
 
-            neighbor_coverage = calc.calculate_coverage(neighbor_locations)
+            neighbor_coverage, neighbor_uncovered = calc.calculate_coverage_with_uncovered(neighbor_locations)
             neighbor_cost = sa_cost_function(len(neighbor_locations),
                                              neighbor_coverage,
                                              target_coverage, w_bs, w_coverage)
@@ -978,12 +1055,14 @@ def simulated_annealing(
                 current_locations = neighbor_locations
                 current_cost = neighbor_cost
                 current_coverage = neighbor_coverage
+                current_uncovered = neighbor_uncovered
 
                 # Track global best
                 if current_cost < best_cost:
                     best_locations = list(current_locations)
                     best_cost = current_cost
                     best_coverage = current_coverage
+                    best_uncovered = current_uncovered
 
             total_iters += 1
 
@@ -1039,7 +1118,7 @@ def simulated_annealing(
     }
 
 
-def run_sa_optimization(target_coverage: float = 90.0):
+def run_sa_optimization(target_coverage: float = 95.0):
     """Run simulated annealing for a given coverage target and display the result."""
     import matplotlib.pyplot as plt
     import matplotlib.patches as mpatches
