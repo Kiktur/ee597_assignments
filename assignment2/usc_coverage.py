@@ -751,63 +751,199 @@ def sa_cost_function(
     return w_bs * num_bs + w_coverage * shortfall * shortfall
 
 
+def _compute_coverage_mask(
+    calc: 'CoverageCalculator',
+    bs_locations: List[Tuple[float, float]]
+) -> np.ndarray:
+    """Compute binary coverage mask (which outdoor pixels are covered).
+
+    Returns a uint8 array of length small_total where 1=covered, 0=uncovered.
+    Only counts outdoor pixels (buildings are excluded).
+
+    Args:
+        calc: CoverageCalculator instance.
+        bs_locations: List of (x_meters, y_meters) BS positions.
+
+    Returns:
+        Binary mask array (uint8) indicating covered outdoor pixels.
+    """
+    if not bs_locations:
+        return np.zeros(calc.small_total, dtype=np.uint8)
+
+    # Use calculate_coverage_detailed which already computes per-BS coverage masks
+    result = calc.calculate_coverage_detailed(bs_locations)
+
+    # Extract combined coverage: any pixel covered by at least one BS
+    combined_mask = np.zeros(calc.small_total, dtype=np.uint8)
+    for i in range(calc.small_total):
+        if calc.small_mask[i] == 0:  # outdoor pixel only
+            # Check if covered (non-white pixel in result)
+            sy = i // calc.small_w
+            sx = i % calc.small_w
+            # If pixel is not white (255, 255, 255), it's covered
+            r, g, b = result['image_data'][sy, sx, :3]
+            if r != 255 or g != 255 or b != 255:
+                combined_mask[i] = 1
+
+    return combined_mask
+
+
+def _count_uncovered_in_range(
+    calc: 'CoverageCalculator',
+    candidate_x: float,
+    candidate_y: float,
+    coverage_mask: np.ndarray,
+    max_range: float
+) -> int:
+    """Count uncovered pixels within range of a candidate BS location.
+
+    Fast estimation without full coverage computation - just counts uncovered
+    outdoor pixels within max_range distance.
+
+    Args:
+        calc: CoverageCalculator instance.
+        candidate_x: Candidate X position in meters.
+        candidate_y: Candidate Y position in meters.
+        coverage_mask: Current coverage mask (1=covered, 0=uncovered).
+        max_range: Maximum coverage range in meters.
+
+    Returns:
+        Number of uncovered pixels within range.
+    """
+    count = 0
+    max_range_sq = max_range * max_range
+
+    # Convert candidate to small-grid coordinates
+    cand_sx = candidate_x / calc.m_per_px_x
+    cand_sy = candidate_y / calc.m_per_px_y
+
+    # Check pixels in bounding box around candidate
+    range_px_x = max_range / calc.m_per_px_x
+    range_px_y = max_range / calc.m_per_px_y
+
+    min_sx = max(0, int(cand_sx - range_px_x))
+    max_sx = min(calc.small_w - 1, int(cand_sx + range_px_x) + 1)
+    min_sy = max(0, int(cand_sy - range_px_y))
+    max_sy = min(calc.small_h - 1, int(cand_sy + range_px_y) + 1)
+
+    for sy in range(min_sy, max_sy + 1):
+        pt_ym = (sy + 0.5) * calc.m_per_px_y
+        dy_sq = (pt_ym - candidate_y) ** 2
+
+        for sx in range(min_sx, max_sx + 1):
+            idx = sy * calc.small_w + sx
+
+            # Skip buildings and already-covered pixels
+            if calc.small_mask[idx] == 1 or coverage_mask[idx] == 1:
+                continue
+
+            # Check if within range
+            pt_xm = (sx + 0.5) * calc.m_per_px_x
+            dx_sq = (pt_xm - candidate_x) ** 2
+            dist_sq = dx_sq + dy_sq
+
+            if dist_sq <= max_range_sq:
+                count += 1
+
+    return count
+
+
 def _pick_diverse_location(
     calc: 'CoverageCalculator',
     existing_locations: List[Tuple[float, float]],
     rng: 'SeededRNG',
-    num_candidates: int = 50
+    num_candidates: int = 50,
+    coverage_mask: Optional[np.ndarray] = None,
+    max_range: Optional[float] = None
 ) -> Tuple[float, float]:
-    """Pick a new BS location that maximizes minimum distance to existing BSs.
+    """Pick a new BS location prioritizing areas with many uncovered pixels.
 
-    Samples num_candidates random outdoor locations and returns the one
-    with the greatest minimum distance to any existing BS, encouraging
-    spatial spread and reducing coverage overlap. Uses a large candidate
-    pool to favor open areas far from existing coverage.
+    Samples num_candidates random outdoor locations and evaluates each based on:
+    1. Spatial diversity (distance from existing BSs)
+    2. Uncovered pixel density (if coverage_mask provided)
+
+    When coverage_mask is provided, strongly prioritizes candidates that would
+    cover many uncovered pixels.
 
     Args:
         calc: CoverageCalculator instance.
         existing_locations: Current list of (x_meters, y_meters) BS positions.
         rng: SeededRNG instance for reproducibility.
         num_candidates: Number of random candidates to evaluate (default: 50).
+        coverage_mask: Optional coverage mask for prioritizing uncovered areas.
+        max_range: Optional maximum coverage range (needed if coverage_mask given).
 
     Returns:
-        (x_meters, y_meters) tuple for the most spatially diverse candidate.
+        (x_meters, y_meters) tuple for the best candidate.
     """
     if not existing_locations:
         return calc.get_random_outdoor_location(rng)
 
-    best_loc = None
-    best_min_dist = -1.0
-
+    # Sample candidates
+    candidates = []
     for _ in range(num_candidates):
         x, y = calc.get_random_outdoor_location(rng)
+        candidates.append((x, y))
 
-        # Compute minimum distance to any existing BS
-        min_dist = float('inf')
-        for ex, ey in existing_locations:
-            d = (x - ex) ** 2 + (y - ey) ** 2
-            if d < min_dist:
-                min_dist = d
+    # If coverage-aware mode is enabled
+    if coverage_mask is not None and max_range is not None:
+        best_loc = None
+        best_score = -1.0
 
-        if min_dist > best_min_dist:
-            best_min_dist = min_dist
-            best_loc = (x, y)
+        for x, y in candidates:
+            # Count uncovered pixels this candidate would reach
+            uncovered_count = _count_uncovered_in_range(calc, x, y, coverage_mask, max_range)
 
-    return best_loc
+            # Compute minimum distance to existing BSs (for diversity)
+            min_dist_sq = float('inf')
+            for ex, ey in existing_locations:
+                d_sq = (x - ex) ** 2 + (y - ey) ** 2
+                if d_sq < min_dist_sq:
+                    min_dist_sq = d_sq
+
+            # Combined score: heavily weight uncovered pixels, with diversity bonus
+            # Uncovered pixels are much more important than distance
+            score = uncovered_count * 10.0 + math.sqrt(min_dist_sq)
+
+            if score > best_score:
+                best_score = score
+                best_loc = (x, y)
+
+        return best_loc
+
+    else:
+        # Fallback to pure spatial diversity (no coverage info)
+        best_loc = None
+        best_min_dist = -1.0
+
+        for x, y in candidates:
+            min_dist = float('inf')
+            for ex, ey in existing_locations:
+                d = (x - ex) ** 2 + (y - ey) ** 2
+                if d < min_dist:
+                    min_dist = d
+
+            if min_dist > best_min_dist:
+                best_min_dist = min_dist
+                best_loc = (x, y)
+
+        return best_loc
 
 
 def sa_neighbor(
     calc: 'CoverageCalculator',
     current_locations: List[Tuple[float, float]],
     rng: 'SeededRNG',
-    move_radius: float = 50.0
+    move_radius: float = 50.0,
+    coverage_mask: Optional[np.ndarray] = None,
+    max_range: Optional[float] = None
 ) -> List[Tuple[float, float]]:
     """Generate a neighbor solution by perturbing the current BS placement.
 
     Three move types are chosen at random:
       - Move (50%): Shift a random BS to a nearby outdoor location.
-      - Add  (35%): Insert a new BS in an open area far from existing BSs
-                     (uses spatial diversity with 50 candidates).
+      - Add  (35%): Insert a new BS prioritizing areas with many uncovered pixels
+                     (uses coverage-aware placement with 50 candidates).
       - Remove (15%): Remove a random BS (only if more than 1 remain).
 
     All generated locations are guaranteed to be outdoor via calc.is_outdoor().
@@ -817,6 +953,8 @@ def sa_neighbor(
         current_locations: Current list of (x_meters, y_meters) BS positions.
         rng: SeededRNG instance for reproducibility.
         move_radius: Maximum displacement in meters for the move operation.
+        coverage_mask: Optional coverage mask for coverage-aware placement.
+        max_range: Optional maximum coverage range.
 
     Returns:
         New list of (x_meters, y_meters) BS positions.
@@ -826,8 +964,8 @@ def sa_neighbor(
 
     r = rng.uniform()
 
-    if r < 0.5 and n > 0:
-        # Move: perturb a random BS position
+    if r < 0.25 and n > 0:
+        # Move (25%): perturb a random BS position
         idx = int(rng.uniform() * n) % n
         x_old, y_old = neighbor[idx]
         for _ in range(50):  # retry until outdoor location found
@@ -839,13 +977,18 @@ def sa_neighbor(
                 neighbor[idx] = (x_new, y_new)
                 break
 
-    elif r < 0.85:
-        # Add: insert a new BS in open area (spatial diversity with 50 candidates)
-        x_new, y_new = _pick_diverse_location(calc, neighbor, rng, num_candidates=50)
+    elif r < 0.90:
+        # Add (65%): insert a new BS targeting high-density uncovered areas
+        x_new, y_new = _pick_diverse_location(
+            calc, neighbor, rng,
+            num_candidates=80,
+            coverage_mask=coverage_mask,
+            max_range=max_range
+        )
         neighbor.append((x_new, y_new))
 
     elif n > 1:
-        # Remove: drop a random BS
+        # Remove (10%): drop a random BS
         idx = int(rng.uniform() * n) % n
         neighbor.pop(idx)
 
@@ -866,7 +1009,7 @@ def sa_neighbor(
 
 def simulated_annealing(
     calc: 'CoverageCalculator',
-    target_coverage: float = 90.0,
+    target_coverage: float = 75.0,
     # --- SA parameters (aggressive defaults for speed) ---
     T_init: float = 50.0,
     T_min: float = 2.0,
@@ -931,6 +1074,14 @@ def simulated_annealing(
     current_cost = sa_cost_function(len(current_locations), current_coverage,
                                     target_coverage, w_bs, w_coverage)
 
+    # Compute max range for coverage-aware placement
+    max_range = calc.get_max_range(tx_power=TX_POWER_DBM, noise=NOISE_DBM,
+                                   snr_threshold=SNR_THRESHOLD_DB,
+                                   shadow_std=SHADOW_STD_DB, freq_hz=FREQ_HZ)
+
+    # Cache coverage mask for performance
+    current_coverage_mask = _compute_coverage_mask(calc, current_locations)
+
     best_locations = list(current_locations)
     best_cost = current_cost
     best_coverage = current_coverage
@@ -950,7 +1101,8 @@ def simulated_annealing(
         print(f"  Numba: {'enabled' if NUMBA_AVAILABLE else 'disabled (install for 10x speedup)'}")
         print(f"  Initial BSs: {initial_num_bs}, Seed: {seed}")
         print(f"  Mode: Continue until target coverage is reached")
-        print(f"  Optimization: Spatial diversity (50 candidates)")
+        print(f"  Optimization: Coverage-aware (targets uncovered pixel clusters)")
+        print(f"  Max range: {max_range:.1f}m")
         print(f"{'='*60}")
         print(f"{'Temp':>10s} {'Cost':>10s} {'Coverage':>10s} {'#BS':>5s}")
         print(f"{'-'*10} {'-'*10} {'-'*10} {'-'*5}")
@@ -958,8 +1110,9 @@ def simulated_annealing(
     # Continue until target coverage is reached or safety limit is hit
     while best_coverage < target_coverage and total_iters < max_total_iters:
         for _ in range(max_iter_per_temp):
-            # Generate neighbor using spatial diversity
-            neighbor_locations = sa_neighbor(calc, current_locations, rng, move_radius)
+            # Generate neighbor with coverage-aware placement
+            neighbor_locations = sa_neighbor(calc, current_locations, rng, move_radius,
+                                            current_coverage_mask, max_range)
 
             neighbor_coverage = calc.calculate_coverage(neighbor_locations)
             neighbor_cost = sa_cost_function(len(neighbor_locations),
@@ -978,6 +1131,9 @@ def simulated_annealing(
                 current_locations = neighbor_locations
                 current_cost = neighbor_cost
                 current_coverage = neighbor_coverage
+
+                # Update cached coverage mask only when neighbor is accepted
+                current_coverage_mask = _compute_coverage_mask(calc, current_locations)
 
                 # Track global best
                 if current_cost < best_cost:
@@ -1039,7 +1195,7 @@ def simulated_annealing(
     }
 
 
-def run_sa_optimization(target_coverage: float = 90.0):
+def run_sa_optimization(target_coverage: float = 75.0):
     """Run simulated annealing for a given coverage target and display the result."""
     import matplotlib.pyplot as plt
     import matplotlib.patches as mpatches
